@@ -269,9 +269,15 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
+        let local_addrs: Vec<(String, Vec<u16>)> = http_config
+            .allowed_local_addresses
+            .iter()
+            .map(|a| (a.host.to_lowercase(), a.ports.clone()))
+            .collect();
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
             http_config.allowed_domains.clone(),
+            local_addrs,
             http_config.max_response_size,
             http_config.timeout_secs,
         )));

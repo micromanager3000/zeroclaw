@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod sessions;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -47,6 +48,9 @@ use uuid::Uuid;
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Request timeout (30s) — prevents slow-loris attacks
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Extended request timeout (120s) for webhook with tool execution enabled.
+/// Tool loops may require multiple LLM round-trips.
+pub const REQUEST_TIMEOUT_TOOLS_SECS: u64 = 120;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -310,6 +314,8 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Session manager for multi-turn conversations
+    pub session_manager: Option<Arc<sessions::SessionManager>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -622,6 +628,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             event_tx.clone(),
         ));
 
+    // Session manager for multi-turn webhook conversations
+    let session_manager = if config.gateway.sessions.enabled {
+        let mgr = Arc::new(sessions::SessionManager::new(
+            config.gateway.sessions.clone(),
+            config_state.clone(),
+            &config.workspace_dir,
+        ));
+        mgr.start_cleanup_task();
+        tracing::info!(
+            "Session manager enabled (max_history={}, ttl={}h, persist={})",
+            config.gateway.sessions.max_history_messages,
+            config.gateway.sessions.ttl_hours,
+            config.gateway.sessions.persist_to_file,
+        );
+        Some(mgr)
+    } else {
+        None
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -645,6 +670,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        session_manager,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -683,6 +709,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        // ── Session management ──
+        .route("/sessions", get(handle_sessions_list))
+        .route("/sessions/{id}", get(handle_session_get).delete(handle_session_delete))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -695,7 +724,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(if config.gateway.webhook_enable_tools {
+                REQUEST_TIMEOUT_TOOLS_SECS
+            } else {
+                REQUEST_TIMEOUT_SECS
+            }),
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
@@ -869,6 +902,9 @@ async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow:
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Optional session ID for multi-turn conversations.
+    /// When provided and sessions are enabled, conversation history is maintained.
+    pub session_id: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -986,7 +1022,28 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    let enable_tools = state.config.lock().gateway.webhook_enable_tools;
+
+    // Route through session manager if session_id provided and sessions enabled
+    let result = match (&webhook_body.session_id, &state.session_manager) {
+        (Some(session_id), Some(mgr)) => {
+            tracing::info!("Webhook: session {session_id}");
+            mgr.send_message(session_id, message.to_string()).await
+        }
+        _ => {
+            // No session — use direct chat (simple or with tools)
+            if enable_tools {
+                run_gateway_chat_with_tools(&state, message).await
+            } else {
+                run_gateway_chat_simple(&state, message).await
+            }
+        }
+    };
+
+    // Resolve session_id for response
+    let response_session_id = webhook_body.session_id.as_deref().filter(|_| state.session_manager.is_some());
+
+    match result {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
@@ -1013,7 +1070,10 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let mut body = serde_json::json!({"response": response, "model": state.model});
+            if let Some(sid) = response_session_id {
+                body["session_id"] = serde_json::json!(sid);
+            }
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -1053,6 +1113,65 @@ async fn handle_webhook(
             tracing::error!("Webhook provider error: {}", sanitized);
             let err = serde_json::json!({"error": "LLM request failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+// ── Session management API ──────────────────────────────────────────
+
+/// GET /sessions — list active sessions
+async fn handle_sessions_list(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match &state.session_manager {
+        Some(mgr) => {
+            let sessions = mgr.list_sessions();
+            (StatusCode::OK, Json(serde_json::json!({"sessions": sessions})))
+        }
+        None => {
+            let err = serde_json::json!({"error": "Sessions not enabled"});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+/// GET /sessions/:id — get session details including history
+async fn handle_session_get(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match &state.session_manager {
+        Some(mgr) => match mgr.get_session(&session_id) {
+            Some(detail) => (StatusCode::OK, Json(serde_json::json!(detail))),
+            None => {
+                let err = serde_json::json!({"error": "Session not found"});
+                (StatusCode::NOT_FOUND, Json(err))
+            }
+        },
+        None => {
+            let err = serde_json::json!({"error": "Sessions not enabled"});
+            (StatusCode::NOT_FOUND, Json(err))
+        }
+    }
+}
+
+/// DELETE /sessions/:id — delete a session
+async fn handle_session_delete(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match &state.session_manager {
+        Some(mgr) => {
+            if mgr.delete_session(&session_id) {
+                (StatusCode::OK, Json(serde_json::json!({"deleted": true})))
+            } else {
+                let err = serde_json::json!({"error": "Session not found"});
+                (StatusCode::NOT_FOUND, Json(err))
+            }
+        }
+        None => {
+            let err = serde_json::json!({"error": "Sessions not enabled"});
+            (StatusCode::NOT_FOUND, Json(err))
         }
     }
 }
@@ -1600,6 +1719,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1649,6 +1769,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2015,6 +2136,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2022,6 +2144,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            session_id: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2035,6 +2158,7 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            session_id: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
@@ -2079,12 +2203,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let headers = HeaderMap::new();
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            session_id: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -2098,6 +2224,7 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            session_id: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
@@ -2155,6 +2282,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let response = handle_webhook(
@@ -2163,6 +2291,7 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                session_id: None,
             })),
         )
         .await
@@ -2203,6 +2332,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2217,6 +2347,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                session_id: None,
             })),
         )
         .await
@@ -2256,6 +2387,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2267,6 +2399,7 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                session_id: None,
             })),
         )
         .await
@@ -2314,6 +2447,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2368,6 +2502,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            session_manager: None,
         };
 
         let mut headers = HeaderMap::new();

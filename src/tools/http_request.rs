@@ -10,6 +10,7 @@ use std::time::Duration;
 pub struct HttpRequestTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_local_addresses: Vec<(String, Vec<u16>)>,
     max_response_size: usize,
     timeout_secs: u64,
 }
@@ -18,12 +19,14 @@ impl HttpRequestTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
+        allowed_local_addresses: Vec<(String, Vec<u16>)>,
         max_response_size: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
+            allowed_local_addresses,
             max_response_size,
             timeout_secs,
         }
@@ -44,15 +47,24 @@ impl HttpRequestTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        if self.allowed_domains.is_empty() && self.allowed_local_addresses.is_empty() {
             anyhow::bail!(
-                "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml"
+                "HTTP request tool is enabled but no allowed_domains or allowed_local_addresses are configured. Add [http_request].allowed_domains in config.toml"
             );
         }
 
         let host = extract_host(url)?;
 
         if is_private_or_local_host(&host) {
+            // Check allowed_local_addresses before rejecting
+            if !self.allowed_local_addresses.is_empty() {
+                let port = extract_port(url);
+                if self.allowed_local_addresses.iter().any(|(h, ports)| {
+                    h == &host && ports.contains(&port)
+                }) {
+                    return Ok(url.to_string());
+                }
+            }
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
@@ -380,6 +392,22 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
     Ok(host)
 }
 
+fn extract_port(url: &str) -> u16 {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let is_https = url.starts_with("https://");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Handle host:port format (skip IPv6 bracket notation)
+    if let Some(colon_pos) = authority.rfind(':') {
+        if let Ok(port) = authority[colon_pos + 1..].parse::<u16>() {
+            return port;
+        }
+    }
+    if is_https { 443 } else { 80 }
+}
+
 fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     if allowed_domains.iter().any(|domain| domain == "*") {
         return true;
@@ -461,6 +489,28 @@ mod tests {
         HttpRequestTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
+            vec![],
+            1_000_000,
+            30,
+        )
+    }
+
+    fn test_tool_with_local(
+        allowed_domains: Vec<&str>,
+        local_addrs: Vec<(&str, Vec<u16>)>,
+    ) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let local = local_addrs
+            .into_iter()
+            .map(|(h, p)| (h.to_string(), p))
+            .collect();
+        HttpRequestTool::new(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            local,
             1_000_000,
             30,
         )
@@ -570,7 +620,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec![], vec![], 1_000_000, 30);
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -686,7 +736,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], vec![], 1_000_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -701,7 +751,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], vec![], 1_000_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -722,6 +772,7 @@ mod tests {
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
             10,
             30,
         );
@@ -736,6 +787,7 @@ mod tests {
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
             0, // max_response_size = 0 means no limit
             30,
         );
@@ -748,6 +800,7 @@ mod tests {
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
             5,
             30,
         );
@@ -934,5 +987,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv6"));
+    }
+
+    // ── allowed_local_addresses tests ──
+
+    #[test]
+    fn validate_allows_localhost_with_matching_local_address() {
+        let tool = test_tool_with_local(vec![], vec![("127.0.0.1", vec![9100])]);
+        assert!(tool.validate_url("http://127.0.0.1:9100/skill/123").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_localhost_wrong_port() {
+        let tool = test_tool_with_local(vec![], vec![("127.0.0.1", vec![9100])]);
+        let err = tool
+            .validate_url("http://127.0.0.1:42617/health")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_rejects_localhost_no_local_config() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("http://127.0.0.1:9100/skill/123")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn validate_allows_localhost_name_with_matching_local_address() {
+        let tool = test_tool_with_local(vec![], vec![("localhost", vec![9100])]);
+        assert!(tool.validate_url("http://localhost:9100/tools").is_ok());
+    }
+
+    #[test]
+    fn validate_local_address_default_port_80() {
+        let tool = test_tool_with_local(vec![], vec![("127.0.0.1", vec![80])]);
+        assert!(tool.validate_url("http://127.0.0.1/path").is_ok());
+    }
+
+    #[test]
+    fn extract_port_parses_correctly() {
+        assert_eq!(extract_port("http://127.0.0.1:9100/path"), 9100);
+        assert_eq!(extract_port("https://example.com/path"), 443);
+        assert_eq!(extract_port("http://example.com/path"), 80);
+        assert_eq!(extract_port("http://127.0.0.1:42617/health"), 42617);
     }
 }

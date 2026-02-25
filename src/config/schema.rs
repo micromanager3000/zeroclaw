@@ -800,6 +800,52 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Enable tool execution in webhook responses (full agentic loop).
+    /// When false (default), webhook uses simple single-turn LLM chat without tools.
+    /// When true, webhook runs the full agent loop with tool calls.
+    #[serde(default)]
+    pub webhook_enable_tools: bool,
+
+    /// Session management configuration for multi-turn conversations.
+    #[serde(default)]
+    pub sessions: SessionConfig,
+}
+
+/// Configuration for gateway session management.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionConfig {
+    /// Enable session support. When false, session_id in webhook is ignored.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of non-system messages retained per session.
+    #[serde(default = "default_session_max_history")]
+    pub max_history_messages: usize,
+    /// Persist session history to JSON files in the workspace.
+    #[serde(default = "default_true")]
+    pub persist_to_file: bool,
+    /// Session time-to-live in hours. Sessions idle longer than this are cleaned up.
+    #[serde(default = "default_session_ttl_hours")]
+    pub ttl_hours: u64,
+}
+
+fn default_session_max_history() -> usize {
+    50
+}
+
+fn default_session_ttl_hours() -> u64 {
+    24
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_history_messages: default_session_max_history(),
+            persist_to_file: true,
+            ttl_hours: default_session_ttl_hours(),
+        }
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -848,6 +894,8 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            webhook_enable_tools: false,
+            sessions: SessionConfig::default(),
         }
     }
 }
@@ -1011,6 +1059,7 @@ impl Default for BrowserConfig {
 /// HTTP request tool configuration (`[http_request]` section).
 ///
 /// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
+/// Local/private hosts are blocked unless explicitly listed in `allowed_local_addresses`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
@@ -1019,6 +1068,11 @@ pub struct HttpRequestConfig {
     /// Allowed domains for HTTP requests (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Allowed local/private addresses with port-specific matching.
+    /// Bypasses the default local-host blocking for specific host+port combinations.
+    /// Example: `[{ host = "127.0.0.1", ports = [9100] }]`
+    #[serde(default)]
+    pub allowed_local_addresses: Vec<AllowedLocalAddress>,
     /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
@@ -1027,11 +1081,21 @@ pub struct HttpRequestConfig {
     pub timeout_secs: u64,
 }
 
+/// An allowed local/private address with specific ports.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AllowedLocalAddress {
+    /// Host/IP to allow (e.g. "127.0.0.1", "localhost")
+    pub host: String,
+    /// Allowed ports on this host
+    pub ports: Vec<u16>,
+}
+
 impl Default for HttpRequestConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             allowed_domains: vec![],
+            allowed_local_addresses: vec![],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
         }
@@ -6002,6 +6066,8 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            webhook_enable_tools: false,
+            sessions: SessionConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

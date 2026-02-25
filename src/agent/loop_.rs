@@ -145,7 +145,7 @@ fn autosave_memory_key(prefix: &str) -> String {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
+pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -3213,6 +3213,18 @@ pub async fn run(
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
+    process_message_with_history(config, message, None).await
+}
+
+/// Process a message with optional pre-existing conversation history.
+/// When `existing_history` is `Some`, the new user message is appended and the agent
+/// continues from where the conversation left off. When `None`, a fresh history is
+/// created (system prompt + user message) — identical to `process_message`.
+pub async fn process_message_with_history(
+    config: Config,
+    message: &str,
+    existing_history: Option<&mut Vec<ChatMessage>>,
+) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
     let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -3374,14 +3386,26 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         format!("{context}[{now}] {message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    let mut local_history;
+    let history = match existing_history {
+        Some(h) => {
+            // Continuation: append new user message to existing history
+            h.push(ChatMessage::user(&enriched));
+            h
+        }
+        None => {
+            // First turn: create fresh history with system prompt
+            local_history = vec![
+                ChatMessage::system(&system_prompt),
+                ChatMessage::user(&enriched),
+            ];
+            &mut local_history
+        }
+    };
 
     agent_turn(
         provider.as_ref(),
-        &mut history,
+        history,
         &tools_registry,
         observer.as_ref(),
         provider_name,
