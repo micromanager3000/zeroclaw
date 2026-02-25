@@ -43,6 +43,17 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Stable replacement for `str::floor_char_boundary` (unstable until Rust 1.82).
+///
+/// Returns the largest byte index `<= index` that is a valid UTF-8 char boundary.
+pub fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut end = index.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Utility enum for handling optional values.
 pub enum MaybeSet<T> {
     Set(T),

@@ -1163,11 +1163,7 @@ fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
 }
 
 fn floor_char_boundary_compat(text: &str, index: usize) -> usize {
-    let mut end = index.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
+    crate::util::floor_char_boundary(text, index)
 }
 
 /// Build a human-readable schema hint from a full tool schema response.
